@@ -15,7 +15,7 @@ keywords = [
 
 dependencies = [
         "numpy",
-        "gymnasium[box2d]",
+        "gym==0.22.0",
         "torch",
         "tqdm",
         "matplotlib",

@@ -18,6 +18,8 @@ Usage:
 
 from typing import Any, Dict, List, Tuple
 
+import csv
+import logging
 import os
 import random
 
@@ -30,6 +32,28 @@ import torch.nn.functional as F
 import torch.optim as optim
 from omegaconf import DictConfig
 from rl_exercises.week_6.ppo import PPOAgent, set_seed
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+CSV_PATH = "training_log.csv"
+CSV_HEADER = [
+    "real_steps",
+    "return",
+    "policy_loss",
+    "value_loss",
+    "entropy_loss",
+    "model_s_loss",
+    "model_r_loss",
+    "imag_p_loss",
+    "imag_v_loss",
+    "imag_e_loss",
+]
+
+if not os.path.exists(CSV_PATH):
+    with open(CSV_PATH, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(CSV_HEADER)
 
 
 class DynamicsModel(nn.Module):
@@ -124,6 +148,19 @@ class DynaPPOAgent(PPOAgent):
             self.real_buffer: List[Tuple[np.ndarray, int, float, np.ndarray, bool]] = []
             self.max_buffer_size = max_buffer_size
 
+    def select_action(
+        self, state: np.ndarray
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, float]:
+        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+        with torch.no_grad():
+            logits = self.policy(state_tensor)
+            dist = torch.distributions.Categorical(logits=logits)
+            action = dist.sample()
+            logp = dist.log_prob(action)  # ✅ 不调用 .item()
+            ent = dist.entropy()  # ✅ 不调用 .item()
+            val = self.value_fn(state_tensor).item()
+        return action.item(), logp, ent, val
+
     def store_real(self, traj: List[Any]) -> None:
         """
         Store real environment transitions into the replay buffer.
@@ -158,10 +195,19 @@ class DynaPPOAgent(PPOAgent):
             states, actions, rewards, next_states, _ = zip(*batch)
 
             # TODO: Predict next state delta and reward using the model
+            states = torch.tensor(states, dtype=torch.float32)
+            actions = torch.tensor(actions)
+            rewards = torch.tensor(rewards, dtype=torch.float32)
+            next_states = torch.tensor(next_states, dtype=torch.float32)
+
+            a_onehot = F.one_hot(actions, num_classes=self.env.action_space.n).float()
+
+            delta_pred, r_pred = self.model(states, a_onehot)
+            delta_true = next_states - states
             # TODO: Compute loss for state prediction and reward prediction
-            loss_s = ...  # Placeholder for state loss
-            loss_r = ...  # Placeholder for reward loss
-            loss = ...  # Placeholder for total loss
+            loss_s = F.mse_loss(delta_pred, delta_true)  # Placeholder for state loss
+            loss_r = F.mse_loss(r_pred, rewards)  # Placeholder for reward loss
+            loss = loss_s + loss_r  # Placeholder for total loss
 
             self.model_opt.zero_grad()
             loss.backward()
@@ -196,16 +242,26 @@ class DynaPPOAgent(PPOAgent):
             }
 
         # TODO: Sample a batch of transitions from the replay buffer
-        val_batch = ...
+        val_batch = random.sample(self.real_buffer, num_samples)
         states, actions, rewards, next_states, _ = zip(*val_batch)
+
+        states = torch.tensor(states, dtype=torch.float32)
+        actions = torch.tensor(actions)
+        rewards = torch.tensor(rewards, dtype=torch.float32)
+        next_states = torch.tensor(next_states, dtype=torch.float32)
+
+        a_onehot = F.one_hot(actions, num_classes=self.env.action_space.n).float()
 
         # TODO: Compute MSE (L2) and MAE (L1) for both state and reward predictions
         with torch.no_grad():
             # Calculate metrics
-            state_mse = ...
-            reward_mse = ...
-            state_mae = ...
-            reward_mae = ...
+            delta_pred, r_pred = self.model(states, a_onehot)
+            delta_true = next_states - states
+
+            state_mse = F.mse_loss(delta_pred, delta_true).item()
+            reward_mse = F.mse_loss(r_pred, rewards).item()
+            state_mae = F.l1_loss(delta_pred, delta_true).item()
+            reward_mae = F.l1_loss(r_pred, rewards).item()
 
         return {
             "state_mse": state_mse,
@@ -236,21 +292,21 @@ class DynaPPOAgent(PPOAgent):
             # TODO: Simulate a trajectory using the model
             for step in range(self.imag_horizon):
                 # TODO: Predict action, log-probability, entropy, and value from the PPO policy
-                action, logp, ent, val = ...
+                action, logp, ent, val = self.select_action(s)
 
                 # TODO: Prepare model input tensors
-                a_oh = (  # noqa: F841
-                    F.one_hot(torch.tensor(...), self.env.action_space.n)
+                a_oh = (
+                    F.one_hot(torch.tensor(action), self.env.action_space.n)
                     .unsqueeze(0)
                     .float()
                 )  # noqa: F841
-                s_t = torch.tensor(..., dtype=torch.float32).unsqueeze(0)  # noqa: F841
+                s_t = torch.tensor(s, dtype=torch.float32).unsqueeze(0)  # noqa: F841
 
                 # TODO: Predict next state delta and reward
-                with torch.no_grad():  # Don't track gradients during imagination
-                    delta, r_pred = ...
-                    s2 = ...
-                    r_val = ...
+                with torch.no_grad():
+                    delta, r_pred = self.model(s_t, a_oh)
+                    s2 = s + delta.squeeze(0).numpy()
+                    r_val = r_pred.item()
 
                 # Add some termination probability to make rollouts more realistic
                 done_prob = 0.05  # 5% chance of termination per step
@@ -332,7 +388,7 @@ class DynaPPOAgent(PPOAgent):
         # Ensure directory exists
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         torch.save(checkpoint, filepath)
-        print(f"Checkpoint saved to {filepath}")
+        logger.info(f"Checkpoint saved to {filepath}")
 
     def load_checkpoint(self, filepath: str, load_buffer: bool = True) -> None:
         """
@@ -365,8 +421,8 @@ class DynaPPOAgent(PPOAgent):
             if load_buffer and "real_buffer" in checkpoint:
                 self.real_buffer = checkpoint["real_buffer"]
 
-        print(f"Checkpoint loaded from {filepath}")
-        print(
+        logger.info(f"Checkpoint loaded from {filepath}")
+        logger.info(
             f"Real steps: {self.real_steps}, Imagination steps: {self.imagination_steps}, Episodes: {self.total_episodes}"
         )
 
@@ -426,8 +482,9 @@ class DynaPPOAgent(PPOAgent):
 
             # TODO: Collect one real trajectory (episode)
             while not done and self.real_steps < total_steps:
-                action, logp, ent, val = ...
-                next_state, reward, term, trunc, _ = ...
+                action, logp, ent, val = self.select_action(state)
+                next_state, reward, term, trunc, _ = self.env.step(action)
+
                 done = term or trunc
                 real_traj.append(
                     (state, action, logp, ent, reward, float(done), next_state)
@@ -441,20 +498,20 @@ class DynaPPOAgent(PPOAgent):
                     mean_r, std_r = self.evaluate(eval_env, num_episodes=eval_episodes)
                     stats = self.get_step_statistics()
                     if self.use_model:
-                        print(
+                        logger.info(
                             f"[Eval ] Real Steps {self.real_steps:6d} (Total: {stats['total_steps']:6d}, "
                             f"Imag: {self.imagination_steps:6d}, Ratio: {stats['imagination_ratio']:.2f}) "
                             f"AvgReturn {mean_r:5.1f} ± {std_r:4.1f}"
                         )
                     else:
-                        print(
+                        logger.info(
                             f"[Eval ] Step {self.real_steps:6d} AvgReturn {mean_r:5.1f} ± {std_r:4.1f}"
                         )
 
                 # Model evaluation
                 if self.use_model and self.real_steps % model_eval_interval == 0:
                     model_metrics = self.evaluate_model()
-                    print(
+                    logger.info(
                         f"[Model] Step {self.real_steps:6d} State MSE: {model_metrics['state_mse']:.4f}, "
                         f"Reward MSE: {model_metrics['reward_mse']:.4f}"
                     )
@@ -469,7 +526,7 @@ class DynaPPOAgent(PPOAgent):
             self.total_episodes += 1
 
             # TODO: Perform PPO update on real transitions
-            policy_loss, value_loss, entropy_loss = ...
+            policy_loss, value_loss, entropy_loss = self.update(real_traj)
             last_return = sum(r for *_, r, _, _ in real_traj)
 
             # 2) Model-based steps if enabled
@@ -479,13 +536,32 @@ class DynaPPOAgent(PPOAgent):
             # TODO: If using model, train it and perform imagined updates
             if self.use_model:
                 self.store_real(real_traj)
-                model_state_loss, model_reward_loss = ...
-                imag_policy_loss, imag_value_loss, imag_entropy_loss = ...
+                model_state_loss, model_reward_loss = self.train_model()
+                imag_policy_loss, imag_value_loss, imag_entropy_loss = (
+                    self.imagine_and_update()
+                )
+
+            with open(CSV_PATH, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        self.real_steps,
+                        last_return,
+                        policy_loss,
+                        value_loss,
+                        entropy_loss,
+                        model_state_loss,
+                        model_reward_loss,
+                        imag_policy_loss,
+                        imag_value_loss,
+                        imag_entropy_loss,
+                    ]
+                )
 
             # Unified logging with step tracking
             stats = self.get_step_statistics()
             if self.use_model:
-                print(
+                logger.info(
                     f"[Train] Real Steps {self.real_steps:6d} (Ep: {self.total_episodes:4d}, "
                     f"Total: {stats['total_steps']:6d}, Imag: {self.imagination_steps:6d}) "
                     f"Return {last_return:5.1f} "
@@ -494,7 +570,7 @@ class DynaPPOAgent(PPOAgent):
                     f"Imag P-Loss {imag_policy_loss:.3f} V-Loss {imag_value_loss:.3f} E-Loss {imag_entropy_loss:.3f}"
                 )
             else:
-                print(
+                logger.info(
                     f"[Train] Step {self.real_steps:6d} (Ep: {self.total_episodes:4d}) "
                     f"Return {last_return:5.1f} "
                     f"Policy Loss {policy_loss:.3f} Value Loss {value_loss:.3f} Entropy Loss {entropy_loss:.3f}"
@@ -504,9 +580,10 @@ class DynaPPOAgent(PPOAgent):
         final_save_path = os.path.join(save_dir, "final_checkpoint.pt")
         self.save_checkpoint(final_save_path)
 
-        print("Dyna-PPO training complete.")
+        logger.info("Dyna-PPO training complete.")
         final_stats = self.get_step_statistics()
-        print(
+
+        logger.info(
             f"Final statistics: Real steps: {final_stats['real_steps']}, "
             f"Imagination steps: {final_stats['imagination_steps']}, "
             f"Total episodes: {final_stats['total_episodes']}"
